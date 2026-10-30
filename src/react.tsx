@@ -1,12 +1,14 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { mountVmlPlayer, type VmlPlayerOptions } from "./runtime.js";
+import { mountVmlPlayer, createVerifiedVmlPlayerController, type VmlPlayerOptions } from "./runtime.js";
 
 export type VideomlDomPlayerProps = Omit<VmlPlayerOptions, "onError"> & {
   width?: number;
   height?: number;
   className?: string;
+  loadAudio?: (path: string) => Promise<ArrayBuffer>;
+  loadCompositionAudio?: () => Promise<ArrayBuffer>;
 };
 
 export function VideomlDomPlayer({
@@ -19,6 +21,9 @@ export function VideomlDomPlayer({
   syncGroup,
   onTimeUpdate,
   onXmlChange,
+  resolvedTiming,
+  loadAudio,
+  loadCompositionAudio,
   className,
 }: VideomlDomPlayerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -29,19 +34,18 @@ export function VideomlDomPlayer({
     const container = containerRef.current;
     if (!container) return;
 
-    const cleanup = mountVmlPlayer(container, {
-      xml,
-      autoPlay,
-      clockMode,
-      loop,
-      syncGroup: timelineId,
-      onTimeUpdate,
-      onXmlChange,
-      onError: setError,
-    });
-
-    return cleanup;
-  }, [xml, autoPlay, clockMode, loop, timelineId, onTimeUpdate, onXmlChange]);
+    const options = {xml, autoPlay, clockMode, loop, syncGroup: timelineId, onTimeUpdate, onXmlChange, onError: setError};
+    if (!resolvedTiming) return mountVmlPlayer(container, options);
+    if (!loadAudio && resolvedTiming.segments.length) { setError("Frozen timing requires a segment audio loader"); return; }
+    if (!loadCompositionAudio && resolvedTiming.audioTotalSamples) { setError("Frozen timing requires a composition audio loader"); return; }
+    let cancelled = false;
+    const abort = new AbortController();
+    let cleanup: (() => void) | undefined;
+    void createVerifiedVmlPlayerController(container, {...options, resolvedTiming}, loadAudio ?? (async () => { throw new Error("No segment audio loader"); }), loadCompositionAudio, abort.signal)
+      .then(controller => { if (cancelled) controller.dispose(); else cleanup = () => controller.dispose(); })
+      .catch(error => { if (!cancelled) setError(error instanceof Error ? error.message : String(error)); });
+    return () => { cancelled = true; abort.abort(); cleanup?.(); };
+  }, [xml, autoPlay, clockMode, loop, timelineId, onTimeUpdate, onXmlChange, resolvedTiming, loadAudio, loadCompositionAudio]);
 
   const aspectRatio = width && height ? `${width} / ${height}` : undefined;
   return (

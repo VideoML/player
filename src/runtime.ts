@@ -1,8 +1,10 @@
+import { implicitTransitionId, normalizeSourceElement, qualifiedTimingId, validateResolvedTiming, verifyResolvedAudio, type ResolvedTiming, type SourceElement } from "@videoml/shared/resolved-timing";
 import { executeVomXml } from "./xml.js";
 import { registerFallbackComponents, registerVideoMLComponents } from "@videoml/stdlib/dom";
 
 export type VmlPlayerOptions = {
   xml: string;
+  resolvedTiming?: ResolvedTiming;
   autoPlay?: boolean;
   clockMode?: "bounded" | "live";
   loop?: boolean;
@@ -22,6 +24,8 @@ type TimelineParticipant = {
 type Timeline = {
   id: string;
   fps: number;
+  duration: number | null;
+  clockMode: "bounded" | "live";
   frame: number;
   time: number;
   start: () => void;
@@ -51,6 +55,9 @@ type TimedElement = {
   end: number;
 };
 
+type OwnedAudio = {audio: HTMLAudioElement; url: string; digest: string; refs: number; onError?: (message: string | null) => void};
+const ownedAudio = new Map<string, OwnedAudio>();
+const frozenGroups = new Map<string, string>();
 const timelines = new Map<string, Timeline>();
 const timelineReferences = new Map<string, number>();
 let defaultTimeline: Timeline | null = null;
@@ -93,6 +100,11 @@ const createTimeline = (id: string, fps: number, clockMode: "bounded" | "live", 
 
     time = nextTime;
     frame = Math.floor(time * fps);
+    const media = ownedAudio.get(id)?.audio;
+    if (media && (Math.abs(media.currentTime - time) > 0.1 || !running)) {
+      media.currentTime = Number.isFinite(media.duration) ? Math.min(time, media.duration) : time;
+      if (!running) media.pause();
+    }
     subs.forEach((fn) => fn(time));
     if (running) {
       raf = requestAnimationFrame(tick);
@@ -102,6 +114,8 @@ const createTimeline = (id: string, fps: number, clockMode: "bounded" | "live", 
   const timeline: Timeline = {
     id,
     fps,
+    duration,
+    clockMode,
     get frame() {
       return frame;
     },
@@ -111,11 +125,19 @@ const createTimeline = (id: string, fps: number, clockMode: "bounded" | "live", 
     start() {
       if (running) return;
       running = true;
+      const owner = ownedAudio.get(id);
+      if (owner) {
+        try {
+          const playing = owner.audio.play();
+          void playing?.catch(error => { owner.onError?.(`Audio playback failed: ${String(error)}`); timeline.stop(); });
+        } catch (error) { owner.onError?.(`Audio playback failed: ${String(error)}`); timeline.stop(); return; }
+      }
       lastTs = null;
       raf = requestAnimationFrame(tick);
     },
     stop() {
       running = false;
+      ownedAudio.get(id)?.audio.pause();
       if (raf != null) cancelAnimationFrame(raf);
       raf = null;
       lastTs = null;
@@ -123,6 +145,8 @@ const createTimeline = (id: string, fps: number, clockMode: "bounded" | "live", 
     seek(nextFrame) {
       if (!Number.isSafeInteger(nextFrame) || nextFrame < 0) throw new Error("Frame must be a nonnegative integer");
       frame = nextFrame; time = frame / fps; lastTs = null;
+      const media = ownedAudio.get(id)?.audio;
+      if (media) media.currentTime = Number.isFinite(media.duration) ? Math.min(time, media.duration) : time;
       subs.forEach(fn => fn(time));
     },
     registerParticipant(settle) {
@@ -434,6 +458,27 @@ export function mountVmlPlayer(container: HTMLElement, options: VmlPlayerOptions
   return () => controller.dispose();
 }
 export function createVmlPlayerController(container: HTMLElement, options: VmlPlayerOptions): VmlPlayerController {
+  if (options.resolvedTiming) throw new Error("Frozen timing requires createVerifiedVmlPlayerController");
+  return createPlayerController(container, options);
+}
+
+/** Audio must be verified before a frozen player can mount or autoplay. */
+export async function createVerifiedVmlPlayerController(container: HTMLElement, options: VmlPlayerOptions & {resolvedTiming: ResolvedTiming}, loadAudio: (path: string) => Promise<ArrayBuffer>, loadCompositionAudio?: () => Promise<ArrayBuffer>, signal?: AbortSignal): Promise<VmlPlayerController> {
+  validateResolvedTiming(options.resolvedTiming);
+  if (signal?.aborted) throw new Error("Frozen player cancelled");
+  let composition: ArrayBuffer | undefined;
+  const loadOnce = loadCompositionAudio ? async () => {
+    composition ??= (await loadCompositionAudio()).slice(0);
+    return composition;
+  } : undefined;
+  const canonical = await verifyResolvedAudio(options.resolvedTiming, loadAudio, loadOnce);
+  if (signal?.aborted) throw new Error("Frozen player cancelled");
+  const digest = composition ? Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", composition)), b => b.toString(16).padStart(2,"0")).join("") : null;
+  if (signal?.aborted) throw new Error("Frozen player cancelled");
+  return createPlayerController(container, options, options.resolvedTiming, canonical ? {bytes:canonical, digest:digest!} : undefined);
+}
+
+function createPlayerController(container: HTMLElement, options: VmlPlayerOptions, frozen?: ResolvedTiming, verifiedAudio?: {bytes:ArrayBuffer; digest:string}): VmlPlayerController {
   const {
     xml,
     autoPlay = true,
@@ -447,13 +492,48 @@ export function createVmlPlayerController(container: HTMLElement, options: VmlPl
   } = options;
 
   const timelineId = syncGroup ?? `timeline-${Math.random().toString(36).slice(2)}`;
-
+  const frozenKey = frozen ? JSON.stringify(frozen) : null;
+  let mediaAcquired = false;
+  try {
   registerVideoMLComponents();
-  container.innerHTML = "";
-  onError?.(null);
 
   const parser = new DOMParser();
-  const doc = parser.parseFromString(xml, "text/html");
+  let safeXml = xml;
+  if (frozen) {
+    const xmlDocument = parser.parseFromString(xml, "application/xml");
+    if (xmlDocument.querySelector("parsererror")) throw new Error("Invalid frozen XML");
+    normalizeSourceElement(xmlDocument.documentElement as unknown as SourceElement);
+    const rootElement = xmlDocument.documentElement;
+    const timelineElements = Array.from(rootElement.children).filter(element => ["scene","transition","narration","mark"].includes(element.tagName.toLowerCase()));
+    timelineElements.forEach((element,index) => {
+      if (element.tagName.toLowerCase() !== "scene" || !(element.getAttribute("transition-to-next") || element.getAttribute("transition"))) return;
+      if (timelineElements[index+1]?.tagName.toLowerCase() === "transition") return;
+      const from = element.getAttribute("id");
+      if (!from) throw new Error("Implicit transition requires a source scene ID");
+      const next = timelineElements.slice(index+1).find(item => item.tagName.toLowerCase() === "scene");
+      const implicit = xmlDocument.createElement("transition");
+      implicit.setAttribute("id", implicitTransitionId(from, next?.getAttribute("id") ?? null));
+      implicit.setAttribute("effect", element.getAttribute("transition-to-next") || element.getAttribute("transition")!);
+      for (const name of ["duration", "ease", "props"]) {
+        const value = element.getAttribute(`transition-${name}`);
+        if (value !== null) implicit.setAttribute(name, value);
+      }
+      rootElement.insertBefore(implicit,element.nextSibling);
+    });
+    for (const audio of Array.from(xmlDocument.querySelectorAll("audio"))) audio.remove();
+    if (xmlDocument.querySelector("script, iframe, object, embed")) throw new Error("Frozen playback does not support active source content");
+    for (const element of Array.from(xmlDocument.querySelectorAll("*"))) {
+      if (Array.from(element.attributes).some(attribute => /^on/i.test(attribute.name))) throw new Error("Frozen playback does not support source event handlers");
+    }
+    // HTML parsers ignore XML self-closing syntax on custom elements. Expand
+    // those tags before parsing so siblings retain their source hierarchy.
+    const voidTags = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
+    safeXml = new XMLSerializer().serializeToString(xmlDocument.documentElement).replace(
+      /<([\w:-]+)([^<>]*?)\/>/g,
+      (full, tag: string, attributes: string) => voidTags.has(tag.toLowerCase()) ? full : `<${tag}${attributes}></${tag}>`,
+    );
+  }
+  const doc = parser.parseFromString(safeXml, "text/html");
   const root = doc.body.querySelector("vml, videoml, video-ml");
   if (!root) {
     onError?.("XML root must be <vml>, <videoml>, or <video-ml>.");
@@ -462,13 +542,16 @@ export function createVmlPlayerController(container: HTMLElement, options: VmlPl
 
   let imported = document.importNode(root, true) as Element;
   registerFallbackComponents(imported);
-  container.appendChild(imported);
   if (!(imported instanceof HTMLElement)) {
     const wrapper = document.createElement("div");
     wrapper.appendChild(imported);
     imported = wrapper;
   }
   const importedEl = imported as HTMLElement;
+  if (frozen) {
+    for (const audio of Array.from(importedEl.querySelectorAll("audio"))) audio.remove();
+    for (const video of Array.from(importedEl.querySelectorAll("video"))) video.muted = true;
+  }
   const docRoot = document.documentElement;
   const themeAttr = docRoot.getAttribute("data-theme");
   if (themeAttr) {
@@ -480,12 +563,42 @@ export function createVmlPlayerController(container: HTMLElement, options: VmlPl
     importedEl.classList.remove("dark");
   }
 
-  const { scenes, cues, duration, fps } = computeSceneTimings(xml, importedEl);
-  const timedByScene = new Map<string, TimedElement[]>();
-  for (const scene of scenes) {
-    const list = computeTimedElements(scene.element, scene.start, fps);
-    if (list.length) timedByScene.set(scene.id, list);
+  let scenes: SceneTiming[], cues: CueTiming[], duration: number | null, fps: number;
+  let timedByScene: Map<string, TimedElement[]>;
+  let frozenTransitions: TimedElement[] = [];
+  if (frozen) {
+    const resolved = resolveFrozenDom(importedEl, frozen);
+    ({scenes, cues, duration, fps, timedByScene, transitions: frozenTransitions} = resolved);
+  } else {
+    ({scenes, cues, duration, fps} = computeSceneTimings(xml, importedEl));
+    timedByScene = new Map<string, TimedElement[]>();
+    for (const scene of scenes) {
+      const list = computeTimedElements(scene.element, scene.start, fps);
+      if (list.length) timedByScene.set(scene.id, list);
+    }
   }
+
+  const existingTimeline = timelines.get(timelineId);
+  if (existingTimeline && (frozenGroups.get(timelineId) ?? null) !== frozenKey) throw new Error("Frozen timing conflicts with the existing sync group");
+  const existingAudio = ownedAudio.get(timelineId);
+  if (existingAudio && existingAudio.digest !== verifiedAudio?.digest) throw new Error("Frozen audio conflicts with the existing sync group");
+  if (existingTimeline && frozen && (existingTimeline.fps !== fps || existingTimeline.duration !== duration || existingTimeline.clockMode !== "bounded")) {
+    throw new Error("Frozen timing conflicts with the existing sync group");
+  }
+  if (frozen) frozenGroups.set(timelineId, frozenKey!);
+  if (verifiedAudio) {
+    if (existingAudio) { existingAudio.refs++; mediaAcquired = true; }
+    else {
+      const url = URL.createObjectURL(new Blob([verifiedAudio.bytes], {type:"audio/wav"}));
+      try {
+        const audio = document.createElement("audio"); audio.src = url; audio.preload = "auto";
+        ownedAudio.set(timelineId, {audio, url, digest:verifiedAudio.digest, refs:1, onError}); mediaAcquired = true;
+      } catch (error) { URL.revokeObjectURL(url); throw error; }
+    }
+  }
+  container.innerHTML = "";
+  container.appendChild(importedEl);
+  onError?.(null);
 
   Object.assign(importedEl.style, {
     position: "relative",
@@ -533,7 +646,7 @@ export function createVmlPlayerController(container: HTMLElement, options: VmlPl
 
   let timeline = timelines.get(timelineId);
   if (!timeline) {
-    timeline = createTimeline(timelineId, fps, clockMode, loop, duration);
+    timeline = createTimeline(timelineId, fps, frozen ? "bounded" : clockMode, loop, duration);
     timelines.set(timelineId, timeline);
     if (!defaultTimeline) defaultTimeline = timeline;
     ensureGlobalTimelines();
@@ -568,6 +681,9 @@ export function createVmlPlayerController(container: HTMLElement, options: VmlPl
       }
     }
 
+    for (const transition of frozenTransitions) {
+      (transition.element as HTMLElement).style.display = timeSec >= transition.start && timeSec < transition.end ? "block" : "none";
+    }
     if (activeSceneId) {
       const timed = timedByScene.get(activeSceneId) ?? [];
       for (const item of timed) {
@@ -627,7 +743,7 @@ export function createVmlPlayerController(container: HTMLElement, options: VmlPl
   const flushObserver = () => {
     observerRaf = null;
     if (pendingRebind) {
-      bindInlineHandlers(importedEl, timeline, handlerCleanups);
+      if (!frozen) bindInlineHandlers(importedEl, timeline, handlerCleanups);
       pendingRebind = false;
     }
     if (pendingSerialize && onXmlChange) {
@@ -655,7 +771,7 @@ export function createVmlPlayerController(container: HTMLElement, options: VmlPl
 
   observer.observe(importedEl, { subtree: true, childList: true, attributes: true, characterData: true });
 
-  bindInlineHandlers(importedEl, timeline, handlerCleanups);
+  if (!frozen) bindInlineHandlers(importedEl, timeline, handlerCleanups);
 
   let disposed = false;
   const participant=timeline.registerParticipant(async frame=>{
@@ -677,11 +793,79 @@ export function createVmlPlayerController(container: HTMLElement, options: VmlPl
       unsubscribe(); observer.disconnect();
       for (const cleanup of handlerCleanups) cleanup(); handlerCleanups.length = 0;
       if (observerRaf != null) cancelAnimationFrame(observerRaf);
+      if (mediaAcquired) releaseOwnedAudio(timelineId);
       const remaining = (timelineReferences.get(timelineId) ?? 1) - 1;
       if (remaining === 0) {
-        timeline.stop(); timelineReferences.delete(timelineId); timelines.delete(timelineId);
+        timeline.stop(); timelineReferences.delete(timelineId); timelines.delete(timelineId); frozenGroups.delete(timelineId);
         if (defaultTimeline === timeline) { defaultTimeline = timelines.values().next().value ?? null; if (typeof window !== "undefined") (window as any).timeline = defaultTimeline; }
       } else timelineReferences.set(timelineId, remaining);
     },
   };
+  } catch (error) {
+    if (mediaAcquired) releaseOwnedAudio(timelineId);
+    if (!timelines.has(timelineId)) frozenGroups.delete(timelineId);
+    throw error;
+  }
+}
+
+function releaseOwnedAudio(timelineId: string): void {
+  const owner = ownedAudio.get(timelineId);
+  if (!owner || --owner.refs > 0) return;
+  owner.audio.pause(); owner.audio.removeAttribute("src"); owner.audio.load();
+  URL.revokeObjectURL(owner.url); ownedAudio.delete(timelineId);
+}
+
+/** Match explicit source IDs to frozen intervals without consulting XML timing attributes. */
+export function resolveFrozenDom(root: Element, timing: ResolvedTiming): {scenes: SceneTiming[]; cues: CueTiming[]; duration: number; fps: number; timedByScene: Map<string, TimedElement[]>; transitions: TimedElement[]} {
+  validateResolvedTiming(timing);
+  const intervals = new Map([...timing.scenes, ...timing.cues, ...timing.layers, ...timing.components, ...timing.transitions].map(item => [item.id,item]));
+  const seen = new Set<string>();
+  const ordered = new Map<string, string[]>();
+  const get = (kind: string, path: string[]) => {
+    const id = qualifiedTimingId(kind,path), interval = intervals.get(id);
+    if (!interval || seen.has(id)) throw new Error(`Missing or duplicate frozen interval: ${id}`);
+    seen.add(id);
+    const category = kind === "transition-layer" ? "layer" : kind === "transition-component" ? "component" : kind;
+    const values = ordered.get(category) ?? []; values.push(id); ordered.set(category, values);
+    return {start: interval.startFrame / timing.fps, end: interval.endFrame / timing.fps};
+  };
+  const requireId = (element: Element) => { const id=element.getAttribute("id"); if (!id) throw new Error(`Missing explicit ID on ${element.tagName}`); return id; };
+  const scenes: SceneTiming[] = [];
+  const cues: CueTiming[] = [];
+  const timedByScene = new Map<string, TimedElement[]>();
+  const builtin = new Set(["video","scene","cue","layer","pause","voice","bullet","voiceover","sequence","stack","transition","mark","narration","audio","sfx","music"]);
+  for (const scene of Array.from(root.querySelectorAll("scene"))) {
+    const id = requireId(scene), range = get("scene", [id]); scenes.push({id,...range,element:scene});
+    const timed: TimedElement[] = [];
+    const visit = (container: Element, layerId?: string) => {
+      const children = Array.from(container.children).sort((a,b) => Number(b.tagName.toLowerCase() === "layer") - Number(a.tagName.toLowerCase() === "layer"));
+      for (const child of children) {
+        const tag=child.tagName.toLowerCase();
+        if (tag === "layer") { const lid=requireId(child); timed.push({element:child,...get("layer",[id,lid])}); visit(child,lid); }
+        else if (tag === "sequence" || tag === "stack") visit(child,layerId);
+        else if (!builtin.has(tag)) { const cid=requireId(child); timed.push({element:child,...get("component",layerId ? [id,layerId,cid] : [id,cid])}); }
+      }
+    };
+    visit(scene); timedByScene.set(id,timed);
+  }
+  for (const cue of Array.from(root.querySelectorAll("cue"))) { const id=requireId(cue); cues.push({id,...get("cue",[id]),element:cue}); }
+  const transitions: TimedElement[] = [];
+  for (const element of Array.from(root.querySelectorAll("transition"))) {
+    const tid = requireId(element); transitions.push({element,...get("transition",[tid])});
+    const visitTransition = (container: Element, layerId?: string) => {
+      const children = Array.from(container.children).sort((a,b) => Number(b.tagName.toLowerCase() === "layer") - Number(a.tagName.toLowerCase() === "layer"));
+      for (const child of children) {
+        const tag = child.tagName.toLowerCase();
+        if (tag === "layer") { const lid=requireId(child); transitions.push({element:child,...get("transition-layer",[tid,lid])}); visitTransition(child,lid); }
+        else if (tag === "sequence" || tag === "stack") visitTransition(child,layerId);
+        else if (!builtin.has(tag)) { const cid=requireId(child); transitions.push({element:child,...get("transition-component",layerId ? [tid,layerId,cid] : [tid,cid])}); }
+      }
+    };
+    visitTransition(element);
+  }
+  if (seen.size !== intervals.size) throw new Error("Frozen timing does not match source IDs");
+  for (const [kind, entries] of [["scene",timing.scenes],["cue",timing.cues],["layer",timing.layers],["component",timing.components],["transition",timing.transitions]] as const) {
+    if (JSON.stringify(ordered.get(kind) ?? []) !== JSON.stringify(entries.map(entry=>entry.id))) throw new Error(`Frozen ${kind} order does not match source`);
+  }
+  return {scenes,cues,timedByScene,transitions,fps:timing.fps,duration:timing.durationFrames/timing.fps};
 }

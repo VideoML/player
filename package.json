@@ -10,7 +10,8 @@
     "./react": "./src/react.tsx"
   },
   "dependencies": {
-    "@videoml/stdlib": "0.0.0"
+    "@videoml/stdlib": "0.0.0",
+    "@videoml/shared": "0.0.0"
   },
   "peerDependencies": {
     "react": "^18.0.0",
