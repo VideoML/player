@@ -10,8 +10,15 @@ export type VmlPlayerOptions = {
   onTimeUpdate?: (timeSec: number, durationSec: number) => void;
   onXmlChange?: (xml: string) => void;
   onError?: (message: string | null) => void;
+  settleFrame?: (frame:number, root:HTMLElement) => Promise<void>;
 };
 
+type TimelineParticipant = {
+  active: boolean;
+  settle: (frame:number)=>Promise<void>;
+  cancelled: Promise<void>;
+  cancel: ()=>void;
+};
 type Timeline = {
   id: string;
   fps: number;
@@ -19,6 +26,10 @@ type Timeline = {
   time: number;
   start: () => void;
   stop: () => void;
+  seek: (frame: number) => void;
+  seekSettled: (frame:number, initiator:TimelineParticipant) => Promise<void>;
+  registerParticipant: (settle:(frame:number)=>Promise<void>) => TimelineParticipant;
+  unregisterParticipant: (participant:TimelineParticipant) => void;
   subscribe: (fn: (time: number) => void) => () => void;
 };
 
@@ -41,6 +52,7 @@ type TimedElement = {
 };
 
 const timelines = new Map<string, Timeline>();
+const timelineReferences = new Map<string, number>();
 let defaultTimeline: Timeline | null = null;
 
 const ensureGlobalTimelines = () => {
@@ -58,6 +70,8 @@ const createTimeline = (id: string, fps: number, clockMode: "bounded" | "live", 
   let frame = 0;
   let time = 0;
   const subs = new Set<(t: number) => void>();
+  const participants = new Set<TimelineParticipant>();
+  let seekQueue:Promise<void> = Promise.resolve();
 
   const tick = (ts: number) => {
     if (!running) return;
@@ -105,6 +119,39 @@ const createTimeline = (id: string, fps: number, clockMode: "bounded" | "live", 
       if (raf != null) cancelAnimationFrame(raf);
       raf = null;
       lastTs = null;
+    },
+    seek(nextFrame) {
+      if (!Number.isSafeInteger(nextFrame) || nextFrame < 0) throw new Error("Frame must be a nonnegative integer");
+      frame = nextFrame; time = frame / fps; lastTs = null;
+      subs.forEach(fn => fn(time));
+    },
+    registerParticipant(settle) {
+      let cancel!:()=>void;
+      const cancelled=new Promise<void>(resolve=>{cancel=resolve;});
+      const participant={active:true,settle,cancelled,cancel};participants.add(participant);return participant;
+    },
+    unregisterParticipant(participant) {
+      if (!participant.active) return;
+      participant.active=false; participants.delete(participant); participant.cancel();
+    },
+    seekSettled(nextFrame, initiator) {
+      if (!Number.isSafeInteger(nextFrame) || nextFrame < 0) return Promise.reject(new Error("Frame must be a nonnegative integer"));
+      if (!initiator.active) return Promise.reject(new Error("Player disposed"));
+      timeline.stop();
+      const work=seekQueue.then(async()=>{
+        if (!initiator.active) throw new Error("Player disposed");
+        timeline.stop(); timeline.seek(nextFrame);
+        const current=[...participants].filter(p=>p.active);
+        const results=await Promise.allSettled(current.map(participant=>Promise.race([
+          Promise.resolve().then(()=>participant.settle(nextFrame)), participant.cancelled,
+        ])));
+        if (!initiator.active) throw new Error("Player disposed");
+        for (let i=0;i<results.length;i++) {
+          const result=results[i];
+          if (current[i].active && result.status==='rejected') throw result.reason;
+        }
+      });
+      seekQueue=work.catch(()=>{});return work;
     },
     subscribe(fn) {
       subs.add(fn);
@@ -222,7 +269,7 @@ const computeTimedElements = (sceneEl: Element, sceneStart: number, fps: number)
   return timed;
 };
 
-const bindInlineHandlers = (root: Element, timeline: Timeline) => {
+const bindInlineHandlers = (root: Element, timeline: Timeline, cleanups: Array<() => void>) => {
   const elements = [root, ...Array.from(root.querySelectorAll("*"))];
   for (const el of elements) {
     if (shouldIgnore(el)) continue;
@@ -235,13 +282,12 @@ const bindInlineHandlers = (root: Element, timeline: Timeline) => {
       const key = `data-on-${eventName}-bound`;
       if (el.getAttribute(key) === "true") continue;
       const handler = new Function("event", "target", "timeline", "root", handlerCode);
-      el.addEventListener(eventName, (event) => {
-        try {
-          handler(event, event.target, timeline, root);
-        } catch (err) {
-          console.error(`VideoML handler error for on:${eventName}`, err);
-        }
-      });
+      const listener = (event: Event) => {
+        try { handler(event, event.target, timeline, root); }
+        catch (err) { console.error(`VideoML handler error for on:${eventName}`, err); }
+      };
+      el.addEventListener(eventName, listener);
+      cleanups.push(() => { el.removeEventListener(eventName, listener); el.removeAttribute(key); });
       el.setAttribute(key, "true");
     }
   }
@@ -382,7 +428,12 @@ const computeSceneTimings = (xml: string, root: Element): { scenes: SceneTiming[
   return { scenes: timing, cues: cueTiming, duration, fps };
 };
 
+export type VmlPlayerController = { seek(frame:number):Promise<void>; pause():void; dispose():void };
 export function mountVmlPlayer(container: HTMLElement, options: VmlPlayerOptions): () => void {
+  const controller = createVmlPlayerController(container, options);
+  return () => controller.dispose();
+}
+export function createVmlPlayerController(container: HTMLElement, options: VmlPlayerOptions): VmlPlayerController {
   const {
     xml,
     autoPlay = true,
@@ -392,6 +443,7 @@ export function mountVmlPlayer(container: HTMLElement, options: VmlPlayerOptions
     onTimeUpdate,
     onXmlChange,
     onError,
+    settleFrame,
   } = options;
 
   const timelineId = syncGroup ?? `timeline-${Math.random().toString(36).slice(2)}`;
@@ -405,7 +457,7 @@ export function mountVmlPlayer(container: HTMLElement, options: VmlPlayerOptions
   const root = doc.body.querySelector("vml, videoml, video-ml");
   if (!root) {
     onError?.("XML root must be <vml>, <videoml>, or <video-ml>.");
-    return () => {};
+    return { seek: async () => { throw new Error("Player has no valid XML root"); }, pause: () => {}, dispose: () => {} };
   }
 
   let imported = document.importNode(root, true) as Element;
@@ -487,12 +539,13 @@ export function mountVmlPlayer(container: HTMLElement, options: VmlPlayerOptions
     ensureGlobalTimelines();
   }
 
+  timelineReferences.set(timelineId, (timelineReferences.get(timelineId) ?? 0) + 1);
   (importedEl as any).timeline = timeline;
 
   let lastActiveSceneId: string | null = null;
   const activeCues = new Set<string>();
   const handleTick = (timeSec: number) => {
-    const frame = Math.floor(timeSec * fps);
+    const frame = timeline.frame;
     importedEl.style.setProperty("--video-time", `${timeSec}`);
     importedEl.style.setProperty("--video-frame", `${frame}`);
     importedEl.style.setProperty("--video-fps", `${fps}`);
@@ -566,6 +619,7 @@ export function mountVmlPlayer(container: HTMLElement, options: VmlPlayerOptions
 
   const unsubscribe = timeline.subscribe(handleTick);
 
+  const handlerCleanups: Array<() => void> = [];
   let observerRaf: number | null = null;
   let pendingSerialize = false;
   let pendingRebind = false;
@@ -573,7 +627,7 @@ export function mountVmlPlayer(container: HTMLElement, options: VmlPlayerOptions
   const flushObserver = () => {
     observerRaf = null;
     if (pendingRebind) {
-      bindInlineHandlers(importedEl, timeline);
+      bindInlineHandlers(importedEl, timeline, handlerCleanups);
       pendingRebind = false;
     }
     if (pendingSerialize && onXmlChange) {
@@ -601,14 +655,33 @@ export function mountVmlPlayer(container: HTMLElement, options: VmlPlayerOptions
 
   observer.observe(importedEl, { subtree: true, childList: true, attributes: true, characterData: true });
 
-  bindInlineHandlers(importedEl, timeline);
+  bindInlineHandlers(importedEl, timeline, handlerCleanups);
 
+  let disposed = false;
+  const participant=timeline.registerParticipant(async frame=>{
+    await settleFrame?.(frame,importedEl);
+    if (disposed) return;
+    await document.fonts?.ready;
+    await Promise.all(Array.from(importedEl.querySelectorAll("img")).map(image => image.decode()));
+  });
   if (autoPlay) timeline.start();
-
-  return () => {
-    unsubscribe();
-    observer.disconnect();
-    if (observerRaf != null) cancelAnimationFrame(observerRaf);
-    if (autoPlay) timeline.stop();
+  return {
+    seek(frame) {
+      if (disposed) return Promise.reject(new Error("Player disposed"));
+      return timeline.seekSettled(frame,participant);
+    },
+    pause() { if (!disposed) timeline.stop(); },
+    dispose() {
+      if (disposed) return; disposed = true;
+      timeline.unregisterParticipant(participant);
+      unsubscribe(); observer.disconnect();
+      for (const cleanup of handlerCleanups) cleanup(); handlerCleanups.length = 0;
+      if (observerRaf != null) cancelAnimationFrame(observerRaf);
+      const remaining = (timelineReferences.get(timelineId) ?? 1) - 1;
+      if (remaining === 0) {
+        timeline.stop(); timelineReferences.delete(timelineId); timelines.delete(timelineId);
+        if (defaultTimeline === timeline) { defaultTimeline = timelines.values().next().value ?? null; if (typeof window !== "undefined") (window as any).timeline = defaultTimeline; }
+      } else timelineReferences.set(timelineId, remaining);
+    },
   };
 }
