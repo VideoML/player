@@ -13,6 +13,8 @@ export type VmlPlayerOptions = {
   onXmlChange?: (xml: string) => void;
   onError?: (message: string | null) => void;
   settleFrame?: (frame:number, root:HTMLElement) => Promise<void>;
+  /** Explicitly isolate this scene for browser-painted transition capture. */
+  captureSceneId?: string;
 };
 
 type TimelineParticipant = {
@@ -489,6 +491,7 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
     onXmlChange,
     onError,
     settleFrame,
+    captureSceneId,
   } = options;
 
   const timelineId = syncGroup ?? `timeline-${Math.random().toString(36).slice(2)}`;
@@ -577,6 +580,8 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
       if (list.length) timedByScene.set(scene.id, list);
     }
   }
+
+  if (captureSceneId !== undefined && !scenes.some(scene => scene.id === captureSceneId)) throw new Error('SCENE_CAPTURE_UNAVAILABLE: selected scene does not exist');
 
   const existingTimeline = timelines.get(timelineId);
   if (existingTimeline && (frozenGroups.get(timelineId) ?? null) !== frozenKey) throw new Error("Frozen timing conflicts with the existing sync group");
@@ -668,7 +673,7 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
       const scene = scenes[i];
       const nextScene = scenes[i + 1];
       const end = scene.end ?? (nextScene ? nextScene.start : null);
-      const isActive = timeSec >= scene.start && (end == null || timeSec < end);
+      const isActive = captureSceneId === undefined ? timeSec >= scene.start && (end == null || timeSec < end) : scene.id === captureSceneId;
       if (isActive) {
         activeSceneId = scene.id;
         scene.element.removeAttribute("data-runtime-hidden");
@@ -682,7 +687,7 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
     }
 
     for (const transition of frozenTransitions) {
-      (transition.element as HTMLElement).style.display = timeSec >= transition.start && timeSec < transition.end ? "block" : "none";
+      (transition.element as HTMLElement).style.display = captureSceneId === undefined && timeSec >= transition.start && timeSec < transition.end ? "block" : "none";
     }
     if (activeSceneId) {
       const timed = timedByScene.get(activeSceneId) ?? [];
