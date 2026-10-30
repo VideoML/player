@@ -1,6 +1,8 @@
 import { implicitTransitionId, normalizeSourceElement, qualifiedTimingId, validateResolvedTiming, verifyResolvedAudio, type ResolvedTiming, type SourceElement } from "@videoml/shared/resolved-timing";
 import { executeVomXml } from "./xml.js";
 import { registerFallbackComponents, registerVideoMLComponents } from "@videoml/stdlib/dom";
+import { createBuiltinEffectRegistry, mountFrameEffects } from "@videoml/stdlib/effects/xml";
+import type { EffectRegistry } from "@videoml/stdlib/effects";
 
 export type VmlPlayerOptions = {
   xml: string;
@@ -15,6 +17,10 @@ export type VmlPlayerOptions = {
   settleFrame?: (frame:number, root:HTMLElement) => Promise<void>;
   /** Explicitly isolate this scene for browser-painted transition capture. */
   captureSceneId?: string;
+  effectRegistry?: EffectRegistry;
+  effectAssets?: Readonly<Record<string, unknown>>;
+  effectSeed?: number;
+  assetBaseUrl?: string;
 };
 
 type TimelineParticipant = {
@@ -246,10 +252,10 @@ const dispatchDomEvent = (root: HTMLElement, name: string, detail: Record<string
 
 const TIMING_TAG_EXCLUDE = new Set(["cue", "voice", "pause", "bullet"]);
 
-const computeTimedElements = (sceneEl: Element, sceneStart: number, fps: number): TimedElement[] => {
+const computeTimedElements = (sceneEl: Element, sceneStart: number, fps: number, sceneEnd: number | null = null): TimedElement[] => {
   const timed: TimedElement[] = [];
 
-  const walk = (container: Element, baseStart: number, flow: "sequence" | "stack") => {
+  const walk = (container: Element, baseStart: number, flow: "sequence" | "stack", baseEnd: number) => {
     let cursor = baseStart;
     const defaultChildDuration = parseTimeSeconds(container.getAttribute("defaultChildDuration"), fps)
       ?? parseTimeSeconds(container.getAttribute("default-child-duration"), fps)
@@ -272,6 +278,7 @@ const computeTimedElements = (sceneEl: Element, sceneStart: number, fps: number)
         localEnd = baseStart + endAttr;
       }
 
+      if (localEnd == null && flow === "stack" && (tag === "frame-effect" || tag === "layer" || tag === "sequence" || tag === "stack")) localEnd = baseEnd;
       if (localEnd != null) {
         timed.push({ element: child, start: localStart, end: localEnd });
       } else if (flow === "sequence") {
@@ -282,7 +289,7 @@ const computeTimedElements = (sceneEl: Element, sceneStart: number, fps: number)
 
       // Recurse into container-like nodes or layers to time nested elements
       if (tag === "sequence" || tag === "stack" || tag === "layer" || tag === "scene") {
-        walk(child, localStart, childFlow);
+        walk(child, localStart, childFlow, localEnd ?? baseEnd);
       }
 
       if (flow === "sequence") {
@@ -291,7 +298,7 @@ const computeTimedElements = (sceneEl: Element, sceneStart: number, fps: number)
     }
   };
 
-  walk(sceneEl, sceneStart, "stack");
+  walk(sceneEl, sceneStart, "stack", sceneEnd ?? Infinity);
   return timed;
 };
 
@@ -338,11 +345,11 @@ const parseTimeSeconds = (raw: string | null, fps: number): number | null => {
   if (!raw) return null;
   const value = raw.trim();
   if (!value) return null;
-  const msMatch = value.match(/^([0-9]*\\.?[0-9]+)ms$/);
+  const msMatch = value.match(/^([0-9]*\.?[0-9]+)ms$/);
   if (msMatch) return Number.parseFloat(msMatch[1]) / 1000;
-  const sMatch = value.match(/^([0-9]*\\.?[0-9]+)s$/);
+  const sMatch = value.match(/^([0-9]*\.?[0-9]+)s$/);
   if (sMatch) return Number.parseFloat(sMatch[1]);
-  const fMatch = value.match(/^([0-9]*\\.?[0-9]+)f$/);
+  const fMatch = value.match(/^([0-9]*\.?[0-9]+)f$/);
   if (fMatch) return Number.parseFloat(fMatch[1]) / fps;
   const num = Number.parseFloat(value);
   return Number.isFinite(num) ? num : null;
@@ -492,23 +499,35 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
     onError,
     settleFrame,
     captureSceneId,
+    effectRegistry,
+    effectAssets,
+    effectSeed,
+    assetBaseUrl,
   } = options;
 
   const timelineId = syncGroup ?? `timeline-${Math.random().toString(36).slice(2)}`;
   const frozenKey = frozen ? JSON.stringify(frozen) : null;
   let mediaAcquired = false;
+  let frameEffects: ReturnType<typeof mountFrameEffects> | undefined;
+  const effectAbort = new AbortController();
+  const effectUrls: string[] = [];
+  let effectsDisposed = false;
   try {
   registerVideoMLComponents();
 
   const parser = new DOMParser();
   let safeXml = xml;
-  if (frozen) {
+  let sourceDocument: Document | undefined;
+  const hasFrameEffectXml=/<frame-effect(?:\s|\/|>)/i.test(xml);
+  if (frozen || hasFrameEffectXml) {
     const xmlDocument = parser.parseFromString(xml, "application/xml");
+    sourceDocument = xmlDocument;
     if (xmlDocument.querySelector("parsererror")) throw new Error("Invalid frozen XML");
-    normalizeSourceElement(xmlDocument.documentElement as unknown as SourceElement);
+    for (const element of Array.from(xmlDocument.querySelectorAll("frame-effect"))) if (!element.getAttribute("id")) throw new Error("FRAME_EFFECT_INVALID: explicit id is required");
+    if (frozen) normalizeSourceElement(xmlDocument.documentElement as unknown as SourceElement);
     const rootElement = xmlDocument.documentElement;
     const timelineElements = Array.from(rootElement.children).filter(element => ["scene","transition","narration","mark"].includes(element.tagName.toLowerCase()));
-    timelineElements.forEach((element,index) => {
+    if (frozen) timelineElements.forEach((element,index) => {
       if (element.tagName.toLowerCase() !== "scene" || !(element.getAttribute("transition-to-next") || element.getAttribute("transition"))) return;
       if (timelineElements[index+1]?.tagName.toLowerCase() === "transition") return;
       const from = element.getAttribute("id");
@@ -523,22 +542,31 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
       }
       rootElement.insertBefore(implicit,element.nextSibling);
     });
-    for (const audio of Array.from(xmlDocument.querySelectorAll("audio"))) audio.remove();
+    if (frozen) for (const audio of Array.from(xmlDocument.querySelectorAll("audio"))) audio.remove();
     if (xmlDocument.querySelector("script, iframe, object, embed")) throw new Error("Frozen playback does not support active source content");
     for (const element of Array.from(xmlDocument.querySelectorAll("*"))) {
       if (Array.from(element.attributes).some(attribute => /^on/i.test(attribute.name))) throw new Error("Frozen playback does not support source event handlers");
     }
-    // HTML parsers ignore XML self-closing syntax on custom elements. Expand
-    // those tags before parsing so siblings retain their source hierarchy.
-    const voidTags = new Set(["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"]);
-    safeXml = new XMLSerializer().serializeToString(xmlDocument.documentElement).replace(
-      /<([\w:-]+)([^<>]*?)\/>/g,
-      (full, tag: string, attributes: string) => voidTags.has(tag.toLowerCase()) ? full : `<${tag}${attributes}></${tag}>`,
-    );
   }
-  const doc = parser.parseFromString(safeXml, "text/html");
-  const root = doc.body.querySelector("vml, videoml, video-ml");
-  if (!root) {
+  let root: Element | null;
+  if (sourceDocument && hasFrameEffectXml) {
+    // Construct HTML nodes from parsed XML rather than reparsing XML empty-element syntax as HTML.
+    const convert = (node: Element): Element => {
+      const result = document.createElement(node.tagName);
+      for (const attribute of Array.from(node.attributes)) result.setAttribute(attribute.name, attribute.value);
+      for (const child of Array.from(node.childNodes)) {
+        if (child.nodeType === 1) result.appendChild(convert(child as Element));
+        else if (child.nodeType === 3 || child.nodeType === 4) result.appendChild(document.createTextNode(child.textContent ?? ""));
+      }
+      return result;
+    };
+    root = convert(sourceDocument.documentElement);
+  } else {
+    if(sourceDocument){const voidTags=new Set(["area","base","br","col","embed","hr","img","input","link","meta","param","source","track","wbr"]);safeXml=new XMLSerializer().serializeToString(sourceDocument.documentElement).replace(/<([\w:-]+)([^<>]*?)\/>/g,(full,tag:string,attributes:string)=>voidTags.has(tag.toLowerCase())?full:`<${tag}${attributes}></${tag}>`);}
+    const doc = parser.parseFromString(safeXml, "text/html");
+    root = doc.body.querySelector("vml, videoml, video-ml");
+  }
+  if (!root || !["vml", "videoml", "video-ml"].includes(root.tagName.toLowerCase())) {
     onError?.("XML root must be <vml>, <videoml>, or <video-ml>.");
     return { seek: async () => { throw new Error("Player has no valid XML root"); }, pause: () => {}, dispose: () => {} };
   }
@@ -574,9 +602,24 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
     ({scenes, cues, duration, fps, timedByScene, transitions: frozenTransitions} = resolved);
   } else {
     ({scenes, cues, duration, fps} = computeSceneTimings(xml, importedEl));
+    frozenTransitions=[];
+    for (const transition of Array.from(importedEl.querySelectorAll('transition'))) {
+      const siblings=Array.from(transition.parentElement?.children ?? []);const position=siblings.indexOf(transition);
+      const previous=siblings.slice(0,position).reverse().find(element=>element.tagName.toLowerCase()==='scene');
+      const previousScene=scenes.find(scene=>scene.element===previous);
+      const start=parseTimeSeconds(transition.getAttribute('start'),fps) ?? previousScene?.end;
+      const length=parseTimeSeconds(transition.getAttribute('duration'),fps);
+      const endAttr=parseTimeSeconds(transition.getAttribute('end'),fps);
+      const end=length!=null && start!=null?start+length:endAttr;
+      if(start==null||end==null||!Number.isFinite(start)||!Number.isFinite(end)||end<start) {
+        if(transition.querySelector('frame-effect'))throw new Error('FRAME_EFFECT_INVALID: transition requires a bounded interval');
+        continue;
+      }
+      frozenTransitions.push({element:transition,start,end},...computeTimedElements(transition,start,fps,end));
+    }
     timedByScene = new Map<string, TimedElement[]>();
     for (const scene of scenes) {
-      const list = computeTimedElements(scene.element, scene.start, fps);
+      const list = computeTimedElements(scene.element, scene.start, fps, scene.end);
       if (list.length) timedByScene.set(scene.id, list);
     }
   }
@@ -601,6 +644,49 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
       } catch (error) { URL.revokeObjectURL(url); throw error; }
     }
   }
+  const effectElements=Array.from(importedEl.querySelectorAll('frame-effect')) as HTMLElement[];
+  const authoredSeed=effectElements.length ? importedEl.querySelector('voiceover')?.getAttribute('seed') : null;
+  if (effectElements.length && authoredSeed != null && authoredSeed !== 'random' && (!/^\d+$/.test(authoredSeed) || Number(authoredSeed)>0xffffffff)) throw new Error('FRAME_EFFECT_INVALID: seed must be uint32 or random');
+  if (effectElements.length && authoredSeed === 'random' && !frozen && effectSeed === undefined) throw new Error('FRAME_EFFECT_INVALID: random seed requires frozen timing or an explicit seed');
+  const resolvedEffectSeed=frozen?.generationSeed ?? effectSeed ?? (authoredSeed && authoredSeed !== 'random' ? Number(authoredSeed) : 0);
+  const declarations=Array.from(importedEl.querySelectorAll('assets > asset'));
+  const mountResolvedEffects=(assets:Record<string,unknown>)=>{
+    const width=Number(importedEl.getAttribute('width') ?? 1280),height=Number(importedEl.getAttribute('height') ?? 720);
+    frameEffects=mountFrameEffects(effectElements,effectRegistry??createBuiltinEffectRegistry(),{width,height,fps,seed:resolvedEffectSeed,assets},element=>{
+      for(const scene of scenes){const entry=timedByScene.get(scene.id)?.find(item=>item.element===element);if(entry && Number.isFinite(entry.end))return {startFrame:Math.floor(entry.start*fps),endFrame:Math.ceil(entry.end*fps)};}
+      const transitionEntry=frozenTransitions.find(item=>item.element===element);if(transitionEntry && Number.isFinite(transitionEntry.end))return {startFrame:Math.floor(transitionEntry.start*fps),endFrame:Math.ceil(transitionEntry.end*fps)};
+      throw new Error('FRAME_EFFECT_INVALID: a bounded interval is required');
+    });
+  };
+  const prepareEffects=async()=>{
+    if (!effectElements.length) return;
+    const assets:Record<string,unknown>={...(effectAssets ?? {})};const seen=new Set<string>();let total=0;
+    if(declarations.length>32) throw new Error('ASSET_INVALID: too many assets');
+    for(const element of declarations){
+      const id=element.getAttribute('id'),src=element.getAttribute('src'),type=element.getAttribute('media-type');
+      if(!id||['__proto__','constructor','prototype'].includes(id)||!/^[A-Za-z][A-Za-z0-9_-]*$/.test(id)||seen.has(id)||!src||!type||! /^(font\/woff2|image\/(png|jpeg|webp|svg\+xml))$/.test(type)||src.startsWith('/')||src.includes('\\')||/[?#:%]/.test(src)||src.split('/').some(part=>!part||part==='.'||part==='..')) throw new Error('ASSET_INVALID: invalid declaration');
+      seen.add(id);
+      let url: string | URL;
+      if(id in assets){const value=assets[id];if(typeof value!=='string'||! /^(blob:|data:)/.test(value))throw new Error('ASSET_INVALID: override must be pre-resolved');url=value;}
+      else {const base=new URL(assetBaseUrl ?? document.baseURI,document.baseURI);url=new URL(src,base);if(base.origin!==window.location.origin||url.origin!==window.location.origin)throw new Error('ASSET_INVALID: cross-origin asset');}
+      const response=await fetch(url,{signal:effectAbort.signal,redirect:'error',credentials:'omit'});if(!response.ok||response.headers.get('content-type')?.split(';')[0].trim()!==type){await response.body?.cancel().catch(()=>{});throw new Error('ASSET_INVALID: unavailable or wrong media type');}
+      const declared=Number(response.headers.get('content-length'));if(declared>16*1024*1024){await response.body?.cancel().catch(()=>{});throw new Error('ASSET_INVALID: file too large');}if (!response.body) throw new Error('ASSET_INVALID: missing body');
+      const reader=response.body.getReader(),chunks:ArrayBuffer[]=[];let fileSize=0;
+      try {for(;;){const part=await reader.read();if(part.done)break;fileSize+=part.value.byteLength;total+=part.value.byteLength;if(fileSize>16*1024*1024||total>64*1024*1024)throw new Error('ASSET_INVALID: size limit');chunks.push(Uint8Array.from(part.value).buffer);}} catch(error){await reader.cancel().catch(()=>{});throw error;} finally {reader.releaseLock();}
+      const bytes=new Uint8Array(fileSize);let offset=0;for(const chunk of chunks){bytes.set(new Uint8Array(chunk),offset);offset+=chunk.byteLength;}
+      const tag=(start:number,end:number)=>String.fromCharCode(...bytes.subarray(start,end));
+      if(type==='font/woff2'&&tag(0,4)!=='wOF2'||type==='image/png'&&![137,80,78,71,13,10,26,10].every((x,i)=>bytes[i]===x)||type==='image/jpeg'&&![255,216,255].every((x,i)=>bytes[i]===x)||type==='image/webp'&&!(tag(0,4)==='RIFF'&&tag(8,12)==='WEBP'))throw new Error('ASSET_INVALID: media mismatch');
+      if(type==='image/svg+xml'){const svg=new TextDecoder('utf-8',{fatal:true}).decode(bytes);if(!/^\s*(?:<\?xml[^>]*>\s*)?<svg[\s>]/i.test(svg)||/<\s*(script|style|foreignObject)|<!DOCTYPE|<!ENTITY|\bon\w+\s*=|(?:href|src)\s*=\s*['"]\s*(?!#)|url\s*\(|@import/i.test(svg))throw new Error('ASSET_INVALID: unsupported SVG');}
+      if(effectsDisposed)throw new Error('Player disposed');const objectUrl=URL.createObjectURL(new Blob(chunks,{type}));effectUrls.push(objectUrl);assets[id]=objectUrl;
+    }
+    if(effectsDisposed)throw new Error('Player disposed');
+    mountResolvedEffects(assets);
+  };
+  if (effectElements.length && !declarations.length) mountResolvedEffects({...effectAssets});
+  const effectsReady=declarations.length ? prepareEffects().catch(error=>{effectAbort.abort();for(const url of effectUrls.splice(0))URL.revokeObjectURL(url);throw error;}) : Promise.resolve();
+  void effectsReady.catch(()=>{});
+
+
   container.innerHTML = "";
   container.appendChild(importedEl);
   onError?.(null);
@@ -649,6 +735,7 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
     }
   }
 
+
   let timeline = timelines.get(timelineId);
   if (!timeline) {
     timeline = createTimeline(timelineId, fps, frozen ? "bounded" : clockMode, loop, duration);
@@ -662,8 +749,28 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
 
   let lastActiveSceneId: string | null = null;
   const activeCues = new Set<string>();
+  let effectRunning: Promise<void> | null = null;
+  let effectFrame: number | null = null;
+  let requestedFrame: number | null = null;
+  const settleEffects = (frame: number): Promise<void> => {
+    if (!effectElements.length) return Promise.resolve();
+    if (effectRunning && effectFrame === frame && requestedFrame === null) return effectRunning;
+    requestedFrame = frame;
+    if (!effectRunning) {
+      effectRunning = (async () => {
+        while (requestedFrame !== null) {
+          effectFrame = requestedFrame; requestedFrame = null;
+          await effectsReady;
+          if (effectsDisposed) throw new Error("Player disposed");
+          await frameEffects!.seek(effectFrame);
+        }
+      })().finally(() => { effectRunning = null; effectFrame = null; });
+    }
+    return effectRunning;
+  };
   const handleTick = (timeSec: number) => {
     const frame = timeline.frame;
+    void settleEffects(frame).catch(error=>onError?.(`Frame effect failed: ${String(error)}`));
     importedEl.style.setProperty("--video-time", `${timeSec}`);
     importedEl.style.setProperty("--video-frame", `${frame}`);
     importedEl.style.setProperty("--video-fps", `${fps}`);
@@ -780,6 +887,7 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
 
   let disposed = false;
   const participant=timeline.registerParticipant(async frame=>{
+    await settleEffects(frame);
     await settleFrame?.(frame,importedEl);
     if (disposed) return;
     await document.fonts?.ready;
@@ -794,6 +902,9 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
     pause() { if (!disposed) timeline.stop(); },
     dispose() {
       if (disposed) return; disposed = true;
+      effectsDisposed=true;effectAbort.abort();for(const url of effectUrls) URL.revokeObjectURL(url);
+      let disposeError: unknown;
+      try { frameEffects?.dispose(); } catch (error) { disposeError = error; }
       timeline.unregisterParticipant(participant);
       unsubscribe(); observer.disconnect();
       for (const cleanup of handlerCleanups) cleanup(); handlerCleanups.length = 0;
@@ -804,9 +915,12 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
         timeline.stop(); timelineReferences.delete(timelineId); timelines.delete(timelineId); frozenGroups.delete(timelineId);
         if (defaultTimeline === timeline) { defaultTimeline = timelines.values().next().value ?? null; if (typeof window !== "undefined") (window as any).timeline = defaultTimeline; }
       } else timelineReferences.set(timelineId, remaining);
+      if (disposeError) throw disposeError;
     },
   };
   } catch (error) {
+    effectsDisposed=true;effectAbort.abort();for(const url of effectUrls) URL.revokeObjectURL(url);
+    try { frameEffects?.dispose(); } catch {}
     if (mediaAcquired) releaseOwnedAudio(timelineId);
     if (!timelines.has(timelineId)) frozenGroups.delete(timelineId);
     throw error;

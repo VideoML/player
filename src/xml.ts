@@ -247,7 +247,7 @@ function loadVideoFileFromXml(xml: string): any {
   const getAttr = (el: Element, name: string) => el.getAttribute(name);
   const parseNumber = (value: string | null) => {
     if (!value) return null;
-    if (!/^[-+]?\\d+(\\.\\d+)?$/.test(value)) return null;
+    if (!/^[-+]?\d+(\.\d+)?$/.test(value)) return null;
     return Number.parseFloat(value);
   };
   class MissingTimeReferenceError extends Error {}
@@ -776,7 +776,7 @@ function loadVideoFileFromXml(xml: string): any {
     const bullets: string[] = [];
     for (const child of Array.from(el.children)) {
       if (child.tagName === "voice") {
-        const text = (child.textContent ?? "").replace(/\\s+/g, " ").trim();
+        const text = (child.textContent ?? "").replace(/\s+/g, " ").trim();
         if (!text) continue;
         const trimEnd = getAttr(child, "trim-end");
         segments.push({
@@ -787,7 +787,7 @@ function loadVideoFileFromXml(xml: string): any {
       } else if (child.tagName === "pause") {
         segments.push({ kind: "pause", pause: parsePause(child, ctx) });
       } else if (child.tagName === "bullet") {
-        const bullet = (child.textContent ?? "").replace(/\\s+/g, " ").trim();
+        const bullet = (child.textContent ?? "").replace(/\s+/g, " ").trim();
         if (bullet) bullets.push(bullet);
       }
     }
