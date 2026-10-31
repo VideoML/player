@@ -3,6 +3,8 @@ import { executeVomXml } from "./xml.js";
 import { registerFallbackComponents, registerVideoMLComponents } from "@videoml/stdlib/dom";
 import { createBuiltinEffectRegistry, mountFrameEffects } from "@videoml/stdlib/effects/xml";
 import type { EffectRegistry } from "@videoml/stdlib/effects";
+import {shaderNames,mountSceneCompositor,SceneCaptureError,validateTransitionOptions,type SceneFrameSource,type SceneTransition,type TransitionShader} from "@videoml/stdlib/effects/transitions";
+import gsapModule from "gsap";
 
 export type VmlPlayerOptions = {
   xml: string;
@@ -21,6 +23,10 @@ export type VmlPlayerOptions = {
   effectAssets?: Readonly<Record<string, unknown>>;
   effectSeed?: number;
   assetBaseUrl?: string;
+  /** Trusted host creates independent settled scene capture providers. */
+  transitionSourceFactory?: (sceneId:string)=>SceneFrameSource;
+  transitionAllowCrossfadeFallback?: boolean;
+  onTransitionDiagnostic?: (diagnostic:'CROSSFADE_FALLBACK')=>void;
 };
 
 type TimelineParticipant = {
@@ -413,10 +419,21 @@ const computeSceneTimings = (xml: string, root: Element): { scenes: SceneTiming[
   const timing: SceneTiming[] = [];
   const cueTiming: CueTiming[] = [];
   let cursor = 0;
+  let insertedDuration = 0;
   for (const sceneEl of sceneElements) {
     const id = sceneEl.getAttribute("id") ?? "";
+    const siblings = Array.from(sceneEl.parentElement?.children ?? []);
+    const position = siblings.indexOf(sceneEl);
+    const previous = siblings[position - 1];
     const startAttr = parseTimeSeconds(sceneEl.getAttribute("start"), fps);
-    const start = startAttr != null ? startAttr : cursor;
+    if (previous?.tagName.toLowerCase() === 'transition' && previous.getAttribute('mode') === 'insert') {
+      const length = parseTimeSeconds(previous.getAttribute('duration'), fps) ?? 1;
+      const authoredStart = startAttr == null ? cursor : startAttr + insertedDuration;
+      const shift = Math.max(0, cursor + length - authoredStart);
+      cursor += shift;
+      insertedDuration += shift;
+    }
+    const start = startAttr != null ? startAttr + insertedDuration : cursor;
     const durationAttr = elementDuration(sceneEl, fps);
     const scale = collectTimeScale(sceneEl);
     const end = durationAttr != null ? start + durationAttr * scale : null;
@@ -451,6 +468,20 @@ const computeSceneTimings = (xml: string, root: Element): { scenes: SceneTiming[
         cueTiming.push({ id: cueId, start: cueStart, end: cueEnd, element: cue });
       }
     }
+  }
+  // Match the generated script: overlap transitions begin before the previous
+  // scene ends and pull the next scene's visibility start forward.
+  for (const transition of Array.from(root.querySelectorAll('transition'))) {
+    const siblings = Array.from(transition.parentElement?.children ?? []);
+    const position = siblings.indexOf(transition);
+    const before = siblings.slice(0, position).reverse().find(element => element.tagName.toLowerCase() === 'scene');
+    const after = siblings.slice(position + 1).find(element => element.tagName.toLowerCase() === 'scene');
+    const previous = timing.find(scene => scene.element === before);
+    const next = timing.find(scene => scene.element === after);
+    if (!previous || !next || previous.end == null || transition.getAttribute('mode') === 'insert') continue;
+    const length = parseTimeSeconds(transition.getAttribute('duration'), fps) ?? 1;
+    const start = parseTimeSeconds(transition.getAttribute('start'), fps) ?? Math.max(0, previous.end - length);
+    next.start = Math.min(next.start, start);
   }
   let duration: number | null = null;
   for (const scene of timing) {
@@ -503,12 +534,17 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
     effectAssets,
     effectSeed,
     assetBaseUrl,
+    transitionSourceFactory,
+    transitionAllowCrossfadeFallback,
+    onTransitionDiagnostic,
   } = options;
 
   const timelineId = syncGroup ?? `timeline-${Math.random().toString(36).slice(2)}`;
   const frozenKey = frozen ? JSON.stringify(frozen) : null;
   let mediaAcquired = false;
+  if (transitionAllowCrossfadeFallback && !onTransitionDiagnostic) throw new Error('TRANSITION_INVALID: fallback requires a diagnostic handler');
   let frameEffects: ReturnType<typeof mountFrameEffects> | undefined;
+  const shaderTransitions: Array<{start:number;end:number;controller:SceneTransition}> = [];
   const effectAbort = new AbortController();
   const effectUrls: string[] = [];
   let effectsDisposed = false;
@@ -519,7 +555,8 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
   let safeXml = xml;
   let sourceDocument: Document | undefined;
   const hasFrameEffectXml=/<frame-effect(?:\s|\/|>)/i.test(xml);
-  if (frozen || hasFrameEffectXml) {
+  const hasShaderXml=/<transition(?:\s|\/|>)/i.test(xml);
+  if (frozen || hasFrameEffectXml || hasShaderXml) {
     const xmlDocument = parser.parseFromString(xml, "application/xml");
     sourceDocument = xmlDocument;
     if (xmlDocument.querySelector("parsererror")) throw new Error("Invalid frozen XML");
@@ -549,7 +586,7 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
     }
   }
   let root: Element | null;
-  if (sourceDocument && hasFrameEffectXml) {
+  if (sourceDocument && (hasFrameEffectXml || hasShaderXml)) {
     // Construct HTML nodes from parsed XML rather than reparsing XML empty-element syntax as HTML.
     const convert = (node: Element): Element => {
       const result = document.createElement(node.tagName);
@@ -607,12 +644,12 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
       const siblings=Array.from(transition.parentElement?.children ?? []);const position=siblings.indexOf(transition);
       const previous=siblings.slice(0,position).reverse().find(element=>element.tagName.toLowerCase()==='scene');
       const previousScene=scenes.find(scene=>scene.element===previous);
-      const start=parseTimeSeconds(transition.getAttribute('start'),fps) ?? previousScene?.end;
-      const length=parseTimeSeconds(transition.getAttribute('duration'),fps);
+      const length=parseTimeSeconds(transition.getAttribute('duration'),fps) ?? 1;
+      const start=parseTimeSeconds(transition.getAttribute('start'),fps) ?? (previousScene?.end == null ? undefined : transition.getAttribute('mode') === 'insert' ? previousScene.end : Math.max(0, previousScene.end-(length ?? 0)));
       const endAttr=parseTimeSeconds(transition.getAttribute('end'),fps);
-      const end=length!=null && start!=null?start+length:endAttr;
+      const end=endAttr ?? (start!=null ? start+length : undefined);
       if(start==null||end==null||!Number.isFinite(start)||!Number.isFinite(end)||end<start) {
-        if(transition.querySelector('frame-effect'))throw new Error('FRAME_EFFECT_INVALID: transition requires a bounded interval');
+        if(transition.querySelector('frame-effect') || transition.hasAttribute('effect'))throw new Error('TRANSITION_INVALID: transition requires a bounded interval');
         continue;
       }
       frozenTransitions.push({element:transition,start,end},...computeTimedElements(transition,start,fps,end));
@@ -682,6 +719,29 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
     if(effectsDisposed)throw new Error('Player disposed');
     mountResolvedEffects(assets);
   };
+  if(captureSceneId===undefined){
+    for(const interval of frozenTransitions.filter(item=>item.element.tagName.toLowerCase()==='transition')){
+      const element=interval.element,shader=element.getAttribute('effect') as TransitionShader|null;
+      if(!shader)continue;
+      if(!shaderNames.includes(shader as any)){if(/^(?:fade|crossfade|cut|scale|zoom|(?:slide|push|wipe)(?:-(?:left|right|up|down))?)$/i.test(shader))continue;throw new Error(`TRANSITION_INVALID: unknown effect ${shader}`);}
+      const siblings=Array.from(element.parentElement?.children ?? []),index=siblings.indexOf(element);
+      const from=siblings.slice(0,index).reverse().find(node=>node.tagName.toLowerCase()==='scene')?.getAttribute('id');
+      const to=siblings.slice(index+1).find(node=>node.tagName.toLowerCase()==='scene')?.getAttribute('id');
+      if(!from||!to||!scenes.some(scene=>scene.id===from)||!scenes.some(scene=>scene.id===to))throw new SceneCaptureError('Transition references missing source scenes');
+      if(!transitionSourceFactory)throw new SceneCaptureError('Shader transition requires a scene capture provider');
+      const raw=element.getAttribute('props');let parameters:unknown={};try{if(raw)parameters=JSON.parse(raw);}catch{throw new Error('TRANSITION_INVALID: invalid props JSON');}
+      parameters=validateTransitionOptions(parameters);const easeName=element.getAttribute('ease');const gsap=(gsapModule as any).gsap ?? gsapModule;
+      if(easeName&&!/^[A-Za-z][A-Za-z0-9]*(?:\.(?:in|out|inOut))?$/.test(easeName))throw new Error(`TRANSITION_INVALID: unknown easing ${easeName}`);
+      const ease=easeName?gsap.parseEase(easeName):undefined;if(easeName&&typeof ease!=='function')throw new Error(`TRANSITION_INVALID: unknown easing ${easeName}`);
+      const start=Math.floor(interval.start*fps),end=Math.ceil(interval.end*fps);
+      let fromSource:SceneFrameSource|undefined,toSource:SceneFrameSource|undefined;
+      try {
+        fromSource=transitionSourceFactory(from);toSource=transitionSourceFactory(to);
+        const controller=mountSceneCompositor(element as HTMLElement,{from:fromSource,to:toSource,startFrame:start,endFrame:end,width:Number(importedEl.getAttribute('width')??1280),height:Number(importedEl.getAttribute('height')??720),shader,parameters:parameters as any,ease,allowCrossfadeFallback:transitionAllowCrossfadeFallback,onDiagnostic:onTransitionDiagnostic});
+        shaderTransitions.push({start,end,controller});
+      } catch(error) {for(const source of new Set([fromSource,toSource]))try{source?.dispose();}catch{}throw error;}
+    }
+  }
   if (effectElements.length && !declarations.length) mountResolvedEffects({...effectAssets});
   const effectsReady=declarations.length ? prepareEffects().catch(error=>{effectAbort.abort();for(const url of effectUrls.splice(0))URL.revokeObjectURL(url);throw error;}) : Promise.resolve();
   void effectsReady.catch(()=>{});
@@ -753,7 +813,7 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
   let effectFrame: number | null = null;
   let requestedFrame: number | null = null;
   const settleEffects = (frame: number): Promise<void> => {
-    if (!effectElements.length) return Promise.resolve();
+    if (!effectElements.length && !shaderTransitions.length) return Promise.resolve();
     if (effectRunning && effectFrame === frame && requestedFrame === null) return effectRunning;
     requestedFrame = frame;
     if (!effectRunning) {
@@ -762,7 +822,8 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
           effectFrame = requestedFrame; requestedFrame = null;
           await effectsReady;
           if (effectsDisposed) throw new Error("Player disposed");
-          await frameEffects!.seek(effectFrame);
+          await frameEffects?.seek(effectFrame);
+          await Promise.all(shaderTransitions.filter(transition=>effectFrame!>=transition.start&&effectFrame!<=transition.end).map(transition=>transition.controller.seek(effectFrame!)));
         }
       })().finally(() => { effectRunning = null; effectFrame = null; });
     }
@@ -905,6 +966,7 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
       effectsDisposed=true;effectAbort.abort();for(const url of effectUrls) URL.revokeObjectURL(url);
       let disposeError: unknown;
       try { frameEffects?.dispose(); } catch (error) { disposeError = error; }
+      for(const transition of shaderTransitions)try{transition.controller.dispose();}catch(error){disposeError ??= error;}
       timeline.unregisterParticipant(participant);
       unsubscribe(); observer.disconnect();
       for (const cleanup of handlerCleanups) cleanup(); handlerCleanups.length = 0;
@@ -921,6 +983,7 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
   } catch (error) {
     effectsDisposed=true;effectAbort.abort();for(const url of effectUrls) URL.revokeObjectURL(url);
     try { frameEffects?.dispose(); } catch {}
+    for(const transition of shaderTransitions)try{transition.controller.dispose();}catch{}
     if (mediaAcquired) releaseOwnedAudio(timelineId);
     if (!timelines.has(timelineId)) frozenGroups.delete(timelineId);
     throw error;
