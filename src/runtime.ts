@@ -860,8 +860,10 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
     if (activeSceneId) {
       const timed = timedByScene.get(activeSceneId) ?? [];
       for (const item of timed) {
-        const isVisible = timeSec >= item.start && timeSec < item.end;
         const el = item.element as HTMLElement;
+        const isVisible = el.localName === "frame-effect"
+          ? frame >= Math.floor(item.start * fps) && frame < Math.ceil(item.end * fps)
+          : timeSec >= item.start && timeSec < item.end;
         if (isVisible) {
           const original = el.getAttribute("data-videoml-display");
           if (original != null) {
