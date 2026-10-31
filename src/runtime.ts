@@ -1,8 +1,9 @@
 import { implicitTransitionId, normalizeSourceElement, qualifiedTimingId, validateResolvedTiming, verifyResolvedAudio, type ResolvedTiming, type SourceElement } from "@videoml/shared/resolved-timing";
 import { executeVomXml } from "./xml.js";
 import { registerFallbackComponents, registerVideoMLComponents } from "@videoml/stdlib/dom";
-import { createBuiltinEffectRegistry, mountFrameEffects } from "@videoml/stdlib/effects/xml";
-import type { EffectRegistry } from "@videoml/stdlib/effects";
+import { createBuiltinEffectRegistry, mountFrameEffects, parseFrameEffectProps } from "@videoml/stdlib/effects/xml";
+import { planSceneSnapshots } from "@videoml/stdlib/effects";
+import type { EffectRegistry, SceneSnapshotProvider } from "@videoml/stdlib/effects";
 import {shaderNames,mountSceneCompositor,SceneCaptureError,validateTransitionOptions,type SceneFrameSource,type SceneTransition,type TransitionShader} from "@videoml/stdlib/effects/transitions";
 import gsapModule from "gsap";
 
@@ -22,6 +23,8 @@ export type VmlPlayerOptions = {
   effectRegistry?: EffectRegistry;
   effectAssets?: Readonly<Record<string, unknown>>;
   effectSeed?: number;
+  /** Trusted native-pixel provider; the effect owns and closes each returned bitmap. */
+  effectSceneSnapshots?: SceneSnapshotProvider;
   assetBaseUrl?: string;
   /** Trusted host creates independent settled scene capture providers. */
   transitionSourceFactory?: (sceneId:string)=>SceneFrameSource;
@@ -533,6 +536,7 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
     effectRegistry,
     effectAssets,
     effectSeed,
+    effectSceneSnapshots,
     assetBaseUrl,
     transitionSourceFactory,
     transitionAllowCrossfadeFallback,
@@ -687,9 +691,19 @@ function createPlayerController(container: HTMLElement, options: VmlPlayerOption
   if (effectElements.length && authoredSeed === 'random' && !frozen && effectSeed === undefined) throw new Error('FRAME_EFFECT_INVALID: random seed requires frozen timing or an explicit seed');
   const resolvedEffectSeed=frozen?.generationSeed ?? effectSeed ?? (authoredSeed && authoredSeed !== 'random' ? Number(authoredSeed) : 0);
   const declarations=Array.from(importedEl.querySelectorAll('assets > asset'));
+  const resolvedEffectRegistry=effectRegistry??createBuiltinEffectRegistry();
+  const sceneGraph:Record<string,Array<{sceneId:string;frame:number}>>=Object.create(null),snapshotRoots:Array<{sceneId:string;frame:number}>=[];
+  for(const scene of scenes)sceneGraph[scene.id]=[];
+  for(const element of effectElements){
+    const id=element.getAttribute('effect-id'),version=element.getAttribute('effect-version'),props=element.getAttribute('props');
+    if(!id||!version||props===null)throw new Error('FRAME_EFFECT_INVALID: missing identity or props');
+    const refs=resolvedEffectRegistry.sceneInputs({id,version,parameters:parseFrameEffectProps(props),startFrame:0,endFrame:0});
+    const owner=element.closest('scene')?.id;for(const ref of refs){if(duration!==null&&ref.frame>=Math.ceil(duration*fps))throw new Error('SCENE_CAPTURE_INVALID: source frame outside composition');snapshotRoots.push(ref);if(owner&&Object.hasOwn(sceneGraph,owner))sceneGraph[owner].push(ref);}
+  }
+  planSceneSnapshots(sceneGraph,snapshotRoots);if(snapshotRoots.length&&!effectSceneSnapshots)throw new Error('SCENE_CAPTURE_UNAVAILABLE');
   const mountResolvedEffects=(assets:Record<string,unknown>)=>{
     const width=Number(importedEl.getAttribute('width') ?? 1280),height=Number(importedEl.getAttribute('height') ?? 720);
-    frameEffects=mountFrameEffects(effectElements,effectRegistry??createBuiltinEffectRegistry(),{width,height,fps,seed:resolvedEffectSeed,assets},element=>{
+    frameEffects=mountFrameEffects(effectElements,resolvedEffectRegistry,{width,height,fps,seed:resolvedEffectSeed,assets,sceneSnapshots:effectSceneSnapshots},element=>{
       for(const scene of scenes){const entry=timedByScene.get(scene.id)?.find(item=>item.element===element);if(entry && Number.isFinite(entry.end))return {startFrame:Math.floor(entry.start*fps),endFrame:Math.ceil(entry.end*fps)};}
       const transitionEntry=frozenTransitions.find(item=>item.element===element);if(transitionEntry && Number.isFinite(transitionEntry.end))return {startFrame:Math.floor(transitionEntry.start*fps),endFrame:Math.ceil(transitionEntry.end*fps)};
       throw new Error('FRAME_EFFECT_INVALID: a bounded interval is required');
